@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
+use std::path::Path;
 use std::{collections::HashMap, sync::Arc};
 
 use clap::Parser;
@@ -83,12 +84,12 @@ struct TorrentInfo {
     hash: String,
     category: String,
     tags: String,
+    progress: f64,
 }
 
 #[derive(serde::Deserialize, Debug)]
 struct TorrentFile {
     name: String,
-    progress: f64,
 }
 
 #[tokio::main]
@@ -146,8 +147,8 @@ async fn get_filtered_torrent_info(args: &Args, all_torrent_info: &Vec<TorrentIn
     let category_filter = &args.category;
     let tags_filter: Vec<&str> = args.tags.split(", ").collect();
     let filtered_torrent_info = all_torrent_info.iter().filter(|torrent_info| {
-        let torrent_tags = torrent_info.tags.split(", ").collect();
-        (category_filter.eq(DEFAULT_CATEGORY) || torrent_info.category.eq(category_filter)) && (args.tags.eq(DEFAULT_TAGS) || tags_match(tags_filter.clone(), torrent_tags))
+        let torrent_tags: Vec<&str> = torrent_info.tags.split(", ").collect();
+        torrent_info.progress.eq(&1.0) && (category_filter.eq(DEFAULT_CATEGORY) || torrent_info.category.eq(category_filter)) && (args.tags.eq(DEFAULT_TAGS) || tags_match(tags_filter.clone(), torrent_tags))
     }).cloned().collect();
 
     Ok(filtered_torrent_info)
@@ -158,7 +159,6 @@ fn tags_match(filter_tags: Vec<&str>, torrent_tags: Vec<&str>) -> bool {
 }
 
 async fn get_filtered_torrent_files(
-
     args: &Args,
     client: &Client, 
     api_url: &str, 
@@ -177,11 +177,7 @@ async fn get_filtered_torrent_files(
             .json()
             .await?;
 
-        let completed_files: Vec<&TorrentFile> = files.iter().filter(|file| {
-            file.progress.eq(&1.0)
-        }).collect();
-            
-        completed_files.iter().for_each(|file| {
+        files.iter().for_each(|file| {
             if args.output.within(OutputLevel::Debug) {
                 println!("{}", format!("{}/{}", save_path, file.name).replace("\\", "/"));
             }
@@ -194,19 +190,23 @@ async fn get_filtered_torrent_files(
 
 async fn transfer_files(args: &Args, save_path: &str, filtered_torrent_files: &HashMap<String, String>) -> Result<(), Box<dyn std::error::Error>> {
 
-    filtered_torrent_files.iter().for_each(|(old_file_path, new_file_path)| {
-        println!("Old File Path: {}", old_file_path);
-        println!("New File Path: {}", new_file_path);
+    filtered_torrent_files.iter().for_each(|(old_file_string_path, new_file_string_path)| {
+        let new_file_path = Path::new(new_file_string_path);
         match args.mv_mode {
             MvMode::None => todo!(),
             MvMode::Mv => {
-                if let Err(err) = fs::rename(old_file_path, new_file_path) {
+                if let Err(err) = fs::rename(old_file_string_path, new_file_string_path) {
                     println!("{}", err,);
                 }
             },
             MvMode::Cp => {
-                if let Err(err) = fs::copy(old_file_path, new_file_path) {
-                    println!("{}", err);
+                if let Some(parent) = new_file_path.parent() {
+                    if let Err(err) = fs::create_dir_all(parent) {
+                        println!("Error creating file parent directory: {}", err);
+                    }
+                }
+                if let Err(err) = fs::copy(old_file_string_path, new_file_string_path) {
+                    println!("Error Copying from {} to {}, Error: {}", old_file_string_path, new_file_string_path, err);
                 }
             },
         }
