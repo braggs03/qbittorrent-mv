@@ -1,63 +1,56 @@
-use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::{collections::HashMap, sync::Arc};
-
 use clap::Parser;
+use log::{debug, error, info, LevelFilter};
 use reqwest::Client;
 use reqwest::cookie::Jar;
-use walkdir::WalkDir;
+use simple_logger::SimpleLogger;
+use anyhow::Result;
 
 const DEFAULT_HOST: &str = "localhost";
-const DEFAULT_CATEGORY: &str = "";
-const DEFAULT_TAGS: &str = "";
+const DEFAULT_PORT: &str = "8080";
+const DEFAULT_USERNAME: &str = "admin";
 
 #[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
 struct Args {
 
     /// QBittorrent WebUI Port
-    #[arg(long)]
-    port: String,
-
-    /// QBittorrent WebUI Port
     #[arg(long, default_value_t = String::from(DEFAULT_HOST))]
     ip: String,
 
+    /// QBittorrent WebUI Port
+    #[arg(long, default_value_t = String::from(DEFAULT_PORT))]
+    port: String,
+
     /// QBittorrent WebUI Username
-    #[arg(long)]
+    #[arg(long, default_value_t = String::from(DEFAULT_USERNAME))]
     username: String,
 
     /// QBittorrent WebUI Password
     #[arg(long)]
     password: String,
 
-    // Output Mode - Outputs Dangling Files
-    #[clap(long, default_value_t = OutputLevel::Info, value_enum)]
-    output: OutputLevel,
+    /// Level level - All variants given by LogFilter of Log crate.
+    #[arg(long, default_value_t = LevelFilter::Info)]
+    log_level: LevelFilter,
 
     /// Delete File Mode
-    #[arg(long, default_value_t = MvMode::None, value_enum)]
+    #[arg(long, value_enum)]
     mv_mode: MvMode,
 
     /// Place to Move Filtered Files to.
     #[arg(long)]
     mv_directory: String,
 
-    /// Filter tags - Example: "weird gay porn"
-    #[arg(long, default_value_t = String::from(DEFAULT_TAGS))]
-    tags: String,
+    /// Filter tags - Space separated, example: "weird gay porn".
+    #[arg(long)]
+    tags: Option<String>,
 
-    #[arg(long, default_value_t = String::from(DEFAULT_CATEGORY))]
-    category: String,
+    #[arg(long)]
+    category: Option<String>,
     
-}
-
-#[derive(Debug, Clone, clap::ValueEnum, PartialEq, PartialOrd)]
-enum OutputLevel {
-    None = 0,
-    Info = 1,
-    Debug = 2,
 }
 
 #[derive(Debug, Clone, clap::ValueEnum, PartialEq, PartialOrd)]
@@ -65,13 +58,6 @@ enum MvMode {
     None,
     Mv,
     Cp,
-}
-
-
-impl OutputLevel {
-    fn within(&self, required: OutputLevel) -> bool {
-        *self >= required
-    }
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -93,10 +79,14 @@ struct TorrentFile {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<()> {
     let args = Args::parse();
 
+    let _ = SimpleLogger::new().with_level(args.log_level).init();
+
     let api_url = format!("http://{}:{}/api/v2", args.ip, args.port);
+
+    debug!("QBittorrent API URL: {}", api_url);
 
     let client = get_login_client(&args, &api_url).await?;
 
@@ -106,8 +96,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?
         .json()
         .await
-        .and_then(|save_path: TorrentSavePath| Ok(save_path.save_path))?
-        .replace("\\", "/");
+        .and_then(|save_path: TorrentSavePath| Ok(save_path.save_path))?;
+
+    debug!("QBittorrent Save Path: {}", save_path);
 
     let all_torrent_info: Vec<TorrentInfo> = client
         .get(format!("{}/torrents/info", api_url))
@@ -120,12 +111,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let filtered_torrent_files = get_filtered_torrent_files(&args, &client, &api_url, &save_path, filtered_torrent_info).await?;
 
-    transfer_files(&args, &save_path, &filtered_torrent_files).await?;
+    transfer_files(&args, &filtered_torrent_files).await?;
 
     Ok(())
 }
 
-async fn get_login_client(args: &Args, api_url: &str) -> Result<Client, Box<dyn std::error::Error>> {
+async fn get_login_client(args: &Args, api_url: &str) -> Result<Client> {
     let mut req_credentials = HashMap::new();
     req_credentials.insert("username", &args.username);
     req_credentials.insert("password", &args.password);
@@ -143,12 +134,13 @@ async fn get_login_client(args: &Args, api_url: &str) -> Result<Client, Box<dyn 
     Ok(client)
 }
 
-async fn get_filtered_torrent_info(args: &Args, all_torrent_info: &Vec<TorrentInfo>) -> Result<Vec<TorrentInfo>, Box<dyn std::error::Error>> {
+async fn get_filtered_torrent_info(args: &Args, all_torrent_info: &Vec<TorrentInfo>) -> Result<Vec<TorrentInfo>> {
     let category_filter = &args.category;
-    let tags_filter: Vec<&str> = args.tags.split(", ").collect();
     let filtered_torrent_info = all_torrent_info.iter().filter(|torrent_info| {
         let torrent_tags: Vec<&str> = torrent_info.tags.split(", ").collect();
-        torrent_info.progress.eq(&1.0) && (category_filter.eq(DEFAULT_CATEGORY) || torrent_info.category.eq(category_filter)) && (args.tags.eq(DEFAULT_TAGS) || tags_match(tags_filter.clone(), torrent_tags))
+        torrent_info.progress.eq(&1.0) 
+        && (category_filter.is_none() || torrent_info.category.eq(&category_filter.clone().unwrap())) 
+        && (args.tags.is_none() || tags_match(args.tags.clone().unwrap().split(", ").collect(), torrent_tags))
     }).cloned().collect();
 
     Ok(filtered_torrent_info)
@@ -164,8 +156,7 @@ async fn get_filtered_torrent_files(
     api_url: &str, 
     save_path: &str, 
     all_torrent_info:Vec<TorrentInfo>, 
-) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
-
+) -> Result<HashMap<String, String>> {
     let mut all_torrent_files = HashMap::new();
 
     for torrent in all_torrent_info.iter() {
@@ -178,35 +169,33 @@ async fn get_filtered_torrent_files(
             .await?;
 
         files.iter().for_each(|file| {
-            if args.output.within(OutputLevel::Debug) {
-                println!("{}", format!("{}/{}", save_path, file.name).replace("\\", "/"));
-            }
-            all_torrent_files.insert(format!("{}/{}", save_path, file.name).replace("\\", "/"), format!("{}/{}", args.mv_directory, file.name).replace("\\", "/"));
+            all_torrent_files.insert(format!("{}/{}", save_path, file.name), format!("{}/{}", args.mv_directory, file.name));
         });
     }
 
     Ok(all_torrent_files)
 }
 
-async fn transfer_files(args: &Args, save_path: &str, filtered_torrent_files: &HashMap<String, String>) -> Result<(), Box<dyn std::error::Error>> {
-
+async fn transfer_files(args: &Args, filtered_torrent_files: &HashMap<String, String>) -> Result<()> {
     filtered_torrent_files.iter().for_each(|(old_file_string_path, new_file_string_path)| {
         let new_file_path = Path::new(new_file_string_path);
         match args.mv_mode {
-            MvMode::None => todo!(),
+            MvMode::None => {
+                // Do nothing.
+            },
             MvMode::Mv => {
                 if let Err(err) = fs::rename(old_file_string_path, new_file_string_path) {
-                    println!("{}", err,);
+                    error!("{}", err,);
                 }
             },
             MvMode::Cp => {
                 if let Some(parent) = new_file_path.parent() {
                     if let Err(err) = fs::create_dir_all(parent) {
-                        println!("Error creating file parent directory: {}", err);
+                        error!("Failed to create parent directory: {}", err);
                     }
                 }
                 if let Err(err) = fs::copy(old_file_string_path, new_file_string_path) {
-                    println!("Error Copying from {} to {}, Error: {}", old_file_string_path, new_file_string_path, err);
+                    error!("Failed to copy from {} to {}, Error: {}", old_file_string_path, new_file_string_path, err);
                 }
             },
         }
